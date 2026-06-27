@@ -1,0 +1,59 @@
+import os
+import sys
+import re
+import numpy
+from PIL import Image
+from skimage.metrics import peak_signal_noise_ratio
+from skimage.metrics import structural_similarity
+
+def get_vmaf(reference, distorted):
+    # Run libvmaf command and parse the final "VMAF score:" line.
+    result = os.popen(
+        f'ffmpeg -i "{distorted}" -i "{reference}" '
+        f'-lavfi "[0:v][1:v]libvmaf" '
+        f'-f null - 2>&1'
+    ).read()
+    match = re.search(r'VMAF score:\s*([0-9.]+)', result)
+    return float(match.group(1)) if match else None
+
+image_path = sys.argv[1]
+
+input_stem = os.path.splitext(os.path.basename(image_path))[0]
+ffmpeg_output_path = os.path.join("ffmpeg-output", f"{input_stem}-ffmpeg-output.png")
+smart_output_path = os.path.join("smart-output", f"{input_stem}-smart-output.png")
+
+# Run FFmpeg and force nearest-neighbor chroma reconstruction
+os.system(
+	f'ffmpeg -i "{image_path}" '
+	f'-vf "scale=in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=full,format=yuv420p,'
+	f'scale=iw:ih:flags=neighbor:in_color_matrix=bt709:out_color_matrix=bt709:in_range=full:out_range=full,format=rgb24" '
+	f'-y "{ffmpeg_output_path}" -loglevel quiet'
+)
+
+# Run smart-subsampler script
+os.system(f'python3 smart-subsamplerv1 "{image_path}"')
+
+# Load using PIL and convert to NumPy arrays for math
+original = numpy.array(Image.open(image_path).convert("RGB"))
+ffmpeg   = numpy.array(Image.open(ffmpeg_output_path).convert("RGB"))
+smart_subsampler = numpy.array(Image.open(smart_output_path).convert("RGB"))
+
+
+print("\nCalculating scores...")
+
+
+# Compare
+psnr_ffmpeg = peak_signal_noise_ratio(original, ffmpeg)
+psnr_smart = peak_signal_noise_ratio(original, smart_subsampler)
+    
+ssim_ffmpeg = structural_similarity(original, ffmpeg, channel_axis=2)
+ssim_smart = structural_similarity(original, smart_subsampler, channel_axis=2)
+
+vmaf_ffmpeg = get_vmaf(image_path, ffmpeg_output_path)
+vmaf_smart  = get_vmaf(image_path, smart_output_path)
+
+print(f"\nFFmpeg -> PSNR: {psnr_ffmpeg:.4f}, SSIM: {ssim_ffmpeg:.4f}")
+print(f"Smart  -> PSNR: {psnr_smart:.4f}, SSIM: {ssim_smart:.4f}")
+
+print(f"\nFFmpeg -> VMAF: {vmaf_ffmpeg:.4f}")
+print(f"Smart  -> VMAF: {vmaf_smart:.4f}")

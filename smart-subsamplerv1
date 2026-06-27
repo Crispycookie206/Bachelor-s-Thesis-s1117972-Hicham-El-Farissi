@@ -1,0 +1,214 @@
+import sys
+from PIL import Image
+import numpy
+from pathlib import Path
+
+
+# Grab image path directly from command line input
+image_path = Path(sys.argv[1])
+
+# Load input image
+image = Image.open(image_path).convert("RGB")
+
+# Convert image into array, save the dimensions for later use
+image_array = numpy.array(image).astype(numpy.float32)
+height, width, _ = image_array.shape
+
+# YUV (BT.709) conversion formula
+def rgb_to_yuv(r, g, b):
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    cb = -0.1146 * r - 0.3854 * g + 0.5000 * b + 128
+    cr = 0.5000 * r - 0.4542 * g - 0.0458 * b + 128
+    return y, cb, cr
+
+# Split the array into R, G, and B slices
+RedPlane = image_array[:, :, 0]
+GreenPlane = image_array[:, :, 1]
+BluePlane = image_array[:, :, 2]
+
+# Convert RGB slices to YUV slices
+y_slice, cb_slice, cr_slice = rgb_to_yuv(RedPlane, GreenPlane, BluePlane)
+
+# Create empty 2D arrays for the downsampled chroma
+cb_output = numpy.zeros((height // 2, width // 2), dtype=numpy.float32)
+cr_output = numpy.zeros((height // 2, width // 2), dtype=numpy.float32)
+
+# Helper function
+def measureComplexity(block):
+    # Flatten the 2x2 block into a list
+    pixel = block.flatten()
+    
+    # Calculate 6 differences
+    diffs = [
+        abs(pixel[0] - pixel[1]), abs(pixel[0] - pixel[2]), abs(pixel[0] - pixel[3]),
+        abs(pixel[1] - pixel[2]), abs(pixel[1] - pixel[3]),
+        abs(pixel[2] - pixel[3])
+    ]
+    
+    # Return the average of thedifferences
+    return sum(diffs) / 6.0
+
+# Helper function that mimics Ffmpeg's values
+def bicubicFilter(full_slice, y, x):
+    # Grab the 16 pixels (4x4) around our 2x2 block, edge padding using numpy clip
+    yc = numpy.clip([y-1, y, y+1, y+2], 0, height-1)
+    xc = numpy.clip([x-1, x, x+1, x+2], 0, width-1)
+    
+    # Grab the 16 pixels as a 4x4 grid
+    neighborhood = full_slice[yc][:, xc]
+
+    # Bicubic weight kernel for a 4x4 grid
+    # Mitchell-Netravali spline with B=0, C=0.6 (matches FFmpeg's default bicubic)
+    weights = numpy.array([
+        [+0.005625, -0.043125, -0.043125, +0.005625],
+        [-0.043125, +0.330625, +0.330625, -0.043125],
+        [-0.043125, +0.330625, +0.330625, -0.043125],
+        [+0.005625, -0.043125, -0.043125, +0.005625]
+    ])
+
+    # Multiply each pixel by its weight and sum them up, which results in the final chroma value
+    return numpy.sum(neighborhood * weights)
+
+COMPLEXITY_THRESHOLD = 255.0
+CHROMA_MARGIN = 0.0
+
+# Helper function to check if two pixels are similar in chroma within margin
+def similarChromaValues(cb1, cb2, cr1, cr2):
+    return abs(cb1 - cb2) < CHROMA_MARGIN and abs(cr1 - cr2) < CHROMA_MARGIN
+
+# Helper function to check if two pixels are different in chroma beyond margin
+def differentChromaValues(cb1, cb2, cr1, cr2):
+    return abs(cb1 - cb2) >= CHROMA_MARGIN or abs(cr1 - cr2) >= CHROMA_MARGIN
+
+# Helper function to pick the brightest side average chroma from a 2x2 block
+def pickEdgeSideAverage(y_block, cb_block, cr_block, case):
+    if case == "EDGEHOR":
+        # Horizontal split, so top side vs bottom side
+        y_top = (y_block[0, 0] + y_block[0, 1]) * 0.5
+        y_bottom = (y_block[1, 0] + y_block[1, 1]) * 0.5
+
+        cb_top = (cb_block[0, 0] + cb_block[0, 1]) * 0.5
+        cb_bottom = (cb_block[1, 0] + cb_block[1, 1]) * 0.5
+        cr_top = (cr_block[0, 0] + cr_block[0, 1]) * 0.5
+        cr_bottom = (cr_block[1, 0] + cr_block[1, 1]) * 0.5
+
+        if y_top >= y_bottom:
+            return cb_top, cr_top
+        return cb_bottom, cr_bottom
+
+    if case == "EDGEVER":
+        # Vertical split, so left side vs right side
+        y_left = (y_block[0, 0] + y_block[1, 0]) * 0.5
+        y_right = (y_block[0, 1] + y_block[1, 1]) * 0.5
+
+        cb_left = (cb_block[0, 0] + cb_block[1, 0]) * 0.5
+        cb_right = (cb_block[0, 1] + cb_block[1, 1]) * 0.5
+        cr_left = (cr_block[0, 0] + cr_block[1, 0]) * 0.5
+        cr_right = (cr_block[0, 1] + cr_block[1, 1]) * 0.5
+
+        if y_left >= y_right:
+            return cb_left, cr_left
+        return cb_right, cr_right
+
+# Helper function to determine the case a block falls into
+def patternRecognition(y_block, cb_block, cr_block, complexity_score):
+    p0 = y_block[0, 0]  # top left
+    p1 = y_block[0, 1]  # top right
+    p2 = y_block[1, 0]  # bottom left
+    p3 = y_block[1, 1]  # bottom right
+
+    crtopleft = cr_block[0, 0]
+    crtopright = cr_block[0, 1]
+    crbottomleft = cr_block[1, 0]
+    crbottomright = cr_block[1, 1]
+
+    cbtopleft = cb_block[0, 0]
+    cbtopright = cb_block[0, 1]
+    cbbottomleft = cb_block[1, 0]
+    cbbottomright = cb_block[1, 1]
+
+    if complexity_score < COMPLEXITY_THRESHOLD:
+        return "SMOOTH"
+    elif  (similarChromaValues(cbtopleft, cbtopright, crtopleft, crtopright) and
+          similarChromaValues(cbbottomleft, cbbottomright, crbottomleft, crbottomright) and
+          differentChromaValues(cbtopleft, cbbottomleft, crtopleft, crbottomleft) and
+          differentChromaValues(cbtopright, cbbottomright, crtopright, crbottomright)):
+        return "EDGEHOR"
+    elif  (similarChromaValues(cbtopleft, cbbottomleft, crtopleft, crbottomleft) and
+          similarChromaValues(cbtopright, cbbottomright, crtopright, crbottomright) and
+          differentChromaValues(cbtopleft, cbtopright, crtopleft, crtopright) and
+          differentChromaValues(cbbottomleft, cbbottomright, crbottomleft, crbottomright)):
+        return "EDGEVER"
+    else:
+        return "CHAOS"
+
+# MAIN LOOP
+case_counts = {"SMOOTH": 0, "EDGEHOR": 0, "EDGEVER": 0, "CHAOS": 0}
+for y in range(0, height, 2): # Iterate through the image in 2x2 blocks
+    for x in range(0, width, 2):
+
+        # Take the blocks for Y, Cb, and Cr
+        y_block = y_slice[y:y+2, x:x+2]
+        cb_block = cb_slice[y:y+2, x:x+2]
+        cr_block = cr_slice[y:y+2, x:x+2]
+
+        score = measureComplexity(y_block, cb_block, cr_block)
+
+        case = patternRecognition(y_block, cb_block, cr_block, score)
+        case_counts[case] += 1
+
+        if case == "SMOOTH": # in case smooth, use bicubic filter
+            cb_output[y//2, x//2] = bicubicFilter(cb_slice, y, x)
+            cr_output[y//2, x//2] = bicubicFilter(cr_slice, y, x)
+        elif case == "EDGEHOR" or case == "EDGEVER": # in case edge, pick the brightest chroma pixel
+            cb_output[y//2, x//2], cr_output[y//2, x//2] = pickEdgeSideAverage(y_block, cb_block, cr_block, case)
+        else: # in case chaos, use bicubic filter
+            cb_output[y//2, x//2] = bicubicFilter(cb_slice, y, x)
+            cr_output[y//2, x//2] = bicubicFilter(cr_slice, y, x)
+
+print(f"Case distribution: {case_counts}")
+
+def upsampleNearestNeighbor(downsampled_slice):
+    # Create an empty full res array
+    full_res = numpy.zeros((height, width), dtype=numpy.float32)
+    
+    # Iterate through the downsampled slice
+    for r in range(downsampled_slice.shape[0]):
+        for c in range(downsampled_slice.shape[1]):
+            # Grab one color pixel
+            color = downsampled_slice[r, c]
+        
+            # Map it back to the full resolution slice
+            full_res[r*2 : r*2+2, c*2 : c*2+2] = color
+            
+    return full_res
+
+cb_final = upsampleNearestNeighbor(cb_output)
+cr_final = upsampleNearestNeighbor(cr_output)
+
+# Turn YUV back to RGB for the final output
+def conversionBackToRGB(y, cb, cr):
+    # Subtract the 128 offset
+    cb_og = cb - 128
+    cr_og = cr - 128
+    
+    # BT.709 Inverse Formula
+    r = y + 1.5748 * cr_og
+    g = y - 0.1873 * cb_og - 0.4681 * cr_og
+    b = y + 1.8556 * cb_og
+    
+    # Clip to [0, 255] range and convert to 8-bit integers, then output as an array
+    return numpy.clip([r, g, b], 0, 255).astype(numpy.uint8)
+
+rgb_array = conversionBackToRGB(y_slice, cb_final, cr_final)
+
+# reorder the result so PIL can read it (from 3xHxW to HxWx3)
+rgb_final = numpy.transpose(rgb_array, (1, 2, 0))
+
+# Save the final image
+final_image = Image.fromarray(rgb_final)
+input_stem = image_path.stem
+output_path = Path("smart-output") / f"{input_stem}-smart-output.png"
+final_image.save(output_path)
+
+print(f"Downsampled successfully. Image saved as {output_path}")
